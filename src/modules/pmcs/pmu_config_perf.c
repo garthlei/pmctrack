@@ -20,12 +20,14 @@
 
 #include <pmc/mc_experiments.h>
 #include <pmc/pmu_config.h>
-#if defined(__aarch64__) || defined (__arm__)
+#if defined(__aarch64__) || defined (__arm__) || defined (__riscv)
 #define IS_INTEL 0
 #if defined (__aarch64__)
 #include <pmc/arm64/pmc_bit_layout.h>
-#else
+#elif defined (__arm__)
 #include <pmc/arm/pmc_bit_layout.h>
+#else
+#include <asm/sbi.h>
 #endif
 #else
 #define IS_INTEL (boot_cpu_data.x86_vendor==X86_VENDOR_INTEL)
@@ -153,6 +155,138 @@ static void init_pmu_props_cpu(void* dummy)
 		model=(cpuid >> 4) & 0xfff;
 	}
 	fill_model_string(model,props->arch_string);
+	props->initialized=1;
+}
+
+#ifdef DEBUG
+static void print_pmu_info_cpu(int cpu)
+{
+	pmu_props_t* props=&pmu_props_cpu[cpu];
+
+	printk("*** CPU %d***\n",cpu);
+	printk(KERN_INFO "Version Id:: 0x%lx\n", props->processor_model);
+	printk("GP Counter per Logical Processor:: %d\n",props->nr_gp_pmcs);
+	printk("Number of fixed func. counters:: %d\n", props->nr_fixed_pmcs);
+	printk("Bit width of the PMC:: %d\n", props->pmc_width);
+	printk("***************\n");
+}
+#endif
+
+/* Detect PMUs available in the system  */
+void init_pmu_props(void)
+{
+	int coretype=0;
+	int cpu=0;
+	int model_cpu=0;
+	pmu_props_t* props;
+	int i=0;
+	static pmu_flag_t pmu_flags[]= {
+		{"pmc",8,0},
+		{"usr",1,0},
+		{"os",1,0},
+		{"ebs",32,0},
+		{"pmu",8,0},
+		{"systemwide",1,0},
+		{"coretype",1,1},
+		{NULL,0,0}
+	};
+#define MAX_CORETYPES 2
+	int processor_model[MAX_CORETYPES];
+
+	for (cpu=0; cpu<num_present_cpus(); cpu++)
+		pmu_props_cpu[cpu].initialized=0;
+
+	on_each_cpu(init_pmu_props_cpu, NULL, 1);
+
+	nr_core_types=0;
+
+	for (cpu=0; cpu<num_present_cpus(); cpu++) {
+		model_cpu=pmu_props_cpu[cpu].processor_model;
+		coretype=0;
+
+		if (!pmu_props_cpu[cpu].initialized)
+			continue;
+
+		// Search model type in the list
+		while (coretype<nr_core_types && model_cpu!=processor_model[coretype])
+			coretype++;
+
+		if (coretype>=nr_core_types) { /* Model not found */
+			/* Allocate core type */
+			processor_model[nr_core_types]=model_cpu;
+			coretype_cpu[cpu]=nr_core_types;
+			pmu_props_cpu[cpu].coretype=nr_core_types;
+			nr_core_types++;
+		} else  {/* Model found */
+			coretype_cpu[cpu]=coretype;
+			pmu_props_cpu[cpu].coretype=coretype;
+		}
+	}
+
+	printk("*** PMU Info ***\n");
+	printk("Number of core types detected:: %d\n",nr_core_types);
+
+	for (coretype=0; coretype<nr_core_types; coretype++) {
+		cpu=get_any_cpu_coretype(coretype);
+		props=&pmu_props_cpu[cpu];
+		pmu_props_cputype[coretype]=(*props);
+		props=&pmu_props_cputype[coretype];
+		/* Add flags */
+		props->nr_flags=0;
+		for (i=0; pmu_flags[i].name!=NULL; i++) {
+			props->flags[i]=pmu_flags[i];
+			props->nr_flags++;
+		}
+		printk("[PMU coretype%d]\n",coretype);
+		printk(KERN_INFO "Version Id:: 0x%lx\n", props->processor_model);
+		printk("GP Counter per Logical Processor:: %d\n",props->nr_gp_pmcs);
+		printk("Number of fixed func. counters:: %d\n", props->nr_fixed_pmcs);
+		printk("Bit width of the PMC:: %d\n", props->pmc_width);
+	}
+	printk("***************\n");
+
+#ifdef DEBUG
+	for (cpu=0; cpu<num_present_cpus(); cpu++)
+		print_pmu_info_cpu(cpu);
+#endif
+}
+#elif defined (__riscv)
+
+/* Supported RISC-V processors. */
+static struct pmctrack_cpu_model cpu_models[]= {
+	{0x01,"rocket"},{0x02,"boom"},
+	{0,NULL} /* Marker */
+};
+
+static void fill_model_string(int model, char* model_str)
+{
+	int i=0;
+
+	while(cpu_models[i].model!=0 && cpu_models[i].model!=model)
+		i++;
+	if (cpu_models[i].model==0)
+		sprintf(model_str,"riscv.unknown");
+	else
+		sprintf(model_str,"riscv.%s",cpu_models[i].model_str);
+}
+
+/* Initialize PMU properties of the current CPU  */
+static void init_pmu_props_cpu(void* dummy)
+{
+	int this_cpu=smp_processor_id();
+	pmu_props_t* props=&pmu_props_cpu[this_cpu];
+	unsigned long vendor=riscv_cached_mvendorid(this_cpu);
+
+	props->nr_gp_pmcs=3;
+	props->nr_fixed_pmcs=2; // mcycle and minstret
+	props->pmc_width=40;
+
+	/* Mask */
+	props->pmc_width_mask=(1ULL<<40)-1;
+
+	/* Read PMU ID*/
+	props->processor_model=vendor==0?riscv_cached_marchid(this_cpu):0;
+	fill_model_string(props->processor_model,props->arch_string);
 	props->initialized=1;
 }
 
@@ -645,6 +779,72 @@ free_up_err:
 
 	return -EINVAL;
 }
+#elif defined (__riscv)
+/*
+ * Transform an array of platform-agnostic PMC counter configurations (pmc_cfg)
+ * into a low level structure that holds the necessary data to configure hardware counters.
+ */
+int do_setup_pmcs(pmc_config_set_t* cconfig, int used_pmcs_msk,core_experiment_t* exp,int cpu, int exp_idx, struct task_struct *task)
+{
+	pmc_usrcfg_t* pmc_cfg=cconfig->pmc_cfg;
+	int i,j;
+	low_level_exp* lle;
+	pmu_props_t* props_cpu=get_pmu_props_cpu(cpu);
+	uint64_t config_mask;
+	struct hw_event* llex;
+	int nr_fixed_pmcs_used=0;
+	int max_events=props_cpu->nr_fixed_pmcs+props_cpu->nr_gp_pmcs;
+
+	init_core_experiment_t(exp, exp_idx);
+	exp->need_setup=0; /* In perf setup has been already handled */
+
+	/* Set mask of used pmcs !! */
+	exp->used_pmcs=used_pmcs_msk;
+
+	for (i=0; i<max_events; i++) {
+		/* PMC is used */
+		if ( used_pmcs_msk & (0x1<<i)) {
+
+			/* Set up int just in case */
+			if (pmc_cfg[i].cfg_ebs_mode)  ///* Set EBS idx */
+				exp->ebs_idx=exp->size;
+
+			lle=&exp->array[exp->size++];
+
+			/* Retrieve low level exp from core_experiment */
+			llex=&lle->event;
+
+			init_hw_event(llex);
+
+			config_mask=pmc_cfg[i].cfg_evtsel;
+			nr_fixed_pmcs_used+=props_cpu->nr_fixed_pmcs>0 && i<props_cpu->nr_fixed_pmcs;
+
+			/* Retrieve 'reset_value' from config to hw_event */
+			llex->reset_value=pmc_cfg[i].cfg_reset_value;
+
+			/* Init PERF counter */
+			llex->event=init_counter(task,-1, &pmc_cfg[i], config_mask);
+
+			if (llex->event==NULL)
+				goto free_up_err;
+
+			/* Init EVENT TASK struct */
+			llex->task=task;
+
+			/* Add metainfo in the core experiment */
+			exp->log_to_phys[exp->size-1]=i;
+			exp->phys_to_log[i]=exp->size-1;
+		}
+	}
+
+	return 0;
+free_up_err:
+	for (j=0; j<(exp->size-1); j++)
+		perf_event_release_kernel(exp->array[j].event.event);
+	exp->size=0;
+
+	return -EINVAL;
+}
 #else
 /*
  * Transform an array of platform-agnostic PMC counter configurations (pmc_cfg)
@@ -1069,7 +1269,7 @@ int pmu_shutdown(void)
 
 
 /* Initialize the PMUs of the various CPUs in the system  */
-#if defined(__aarch64__) || defined (__arm__)
+#if defined(__aarch64__) || defined (__arm__) || defined (__riscv)
 int init_pmu(void)
 {
 	int ret=0;

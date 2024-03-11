@@ -1,0 +1,9 @@
+event_name,subevent_name,event_code,description,flags
+instr,-,0x0103,-,-,
+cache_misses,-,0x0302,-,-,
+l1d_cache_misses,-,0x0202,-,-,
+l1d_cache_writebacks,-,0x0402,-,-,
+l1i_cache_misses,-,0x0102,-,-,
+llc_misses,-,0x2002,-,-,
+dtlb_misses,-,0x1002,-,-,
+itlb_misses,-,0x0802,-,-,

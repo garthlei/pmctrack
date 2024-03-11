@@ -305,7 +305,7 @@ extern monitoring_module_t spower_mm;
 #ifdef CONFIG_SMART_POWER_2
 extern monitoring_module_t spower2_mm;
 #endif
-#if defined(CONFIG_PMC_CORE_I7) || defined(CONFIG_PMC_PERF_X86) || defined(CONFIG_PMC_AMD) || defined(CONFIG_PMC_ARM64) || defined (ODROID)
+#if defined(CONFIG_PMC_CORE_I7) || defined(CONFIG_PMC_PERF_X86) || defined(CONFIG_PMC_AMD) || defined(CONFIG_PMC_ARM64) || defined (ODROID) || defined(__riscv)
 extern monitoring_module_t pmcsched_mm;
 #endif
 
@@ -370,6 +370,9 @@ int init_mm_manager(struct proc_dir_entry* pmc_dir)
 #endif
 #ifdef CONFIG_SMART_POWER_2
 	load_monitoring_module(&spower2_mm);
+#endif
+#ifdef __riscv
+	load_monitoring_module(&pmcsched_mm);
 #endif
 	return 0;
 }
